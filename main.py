@@ -8,15 +8,22 @@ import os
 
 # ====== 設定 ======
 symbol = "PI/USDT"
-timeframe = "1m"
+timeframe = "5m"
 lookback_days = 7
-csv_file = "piusdt_1m_7d.csv"
-initial_capital = 1000  # 初期資金(USDT)
-taker_fee_rate = 0.001  # テイカー手数料(0.1%)
+csv_file = "piusdt_5m_7d.csv"
+initial_capital = 1500
+taker_fee_rate = 0.001
 
 exchange = ccxt.bitget()
 
-# ====== ヒストリカルデータ取得 ======
+# ====== テストするパラメータ ======
+param_sets = [
+    (7, 6),
+    (6, 6),
+    (8, 6)
+]
+
+# ====== データ取得 ======
 def fetch_ohlcv_all(symbol, timeframe, days):
     all_data = []
     now = exchange.milliseconds()
@@ -33,70 +40,96 @@ def fetch_ohlcv_all(symbol, timeframe, days):
             break
     return all_data
 
-# ====== データ準備 ======
 if os.path.exists(csv_file):
     print(f"{csv_file} が存在するため、CSVから読み込みます...")
-    df = pd.read_csv(csv_file, parse_dates=["timestamp"])
+    df_base = pd.read_csv(csv_file, parse_dates=["timestamp"])
 else:
     print(f"{csv_file} が存在しないため、APIから取得します...")
     ohlcv_data = fetch_ohlcv_all(symbol, timeframe, lookback_days)
-    df = pd.DataFrame(ohlcv_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df.to_csv(csv_file, index=False)
+    df_base = pd.DataFrame(ohlcv_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df_base["timestamp"] = pd.to_datetime(df_base["timestamp"], unit="ms")
+    df_base.to_csv(csv_file, index=False)
 
-# ====== ボリンジャーバンド計算 ======
-bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
-df["bb_high"] = bb.bollinger_hband()
-df["bb_low"] = bb.bollinger_lband()
+# ====== SuperTrend関数 ======
+def calculate_supertrend(df, period=14, multiplier=3.5):
+    hl2 = (df["high"] + df["low"]) / 2
+    atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=period).average_true_range()
+    upperband = hl2 + (multiplier * atr)
+    lowerband = hl2 - (multiplier * atr)
 
-# ロット数を現在価格から計算（初期資金を全投入）
-current_price = df["close"].iloc[0]
-lot_size = initial_capital / current_price
-print(f"ロット数（PI枚数）: {lot_size:.2f} 枚")
+    supertrend = [True] * len(df)
+    for i in range(1, len(df)):
+        if df["close"].iloc[i] > upperband.iloc[i-1]:
+            supertrend[i] = True
+        elif df["close"].iloc[i] < lowerband.iloc[i-1]:
+            supertrend[i] = False
+        else:
+            supertrend[i] = supertrend[i-1]
+            if supertrend[i] and lowerband.iloc[i] < lowerband.iloc[i-1]:
+                lowerband.iloc[i] = lowerband.iloc[i-1]
+            if not supertrend[i] and upperband.iloc[i] > upperband.iloc[i-1]:
+                upperband.iloc[i] = upperband.iloc[i-1]
+    return pd.DataFrame({
+        "supertrend": supertrend,
+        "upperband": upperband,
+        "lowerband": lowerband
+    })
 
-# ====== バックテスト ======
-position = None
-entry_price = 0
-profit = 0
-profits = []
-timestamps = []
+# ====== バックテスト関数 ======
+def backtest_supertrend(df, period, multiplier):
+    st = calculate_supertrend(df, period=period, multiplier=multiplier)
+    df = pd.concat([df.reset_index(drop=True), st], axis=1)
 
-for i in range(20, len(df)):
-    close = df["close"].iloc[i]
-    bb_high = df["bb_high"].iloc[i]
-    bb_low = df["bb_low"].iloc[i]
+    current_price = df["close"].iloc[0]
+    lot_size = initial_capital / current_price
 
-    if position is None:
-        if close > bb_high:
-            position = "short"
-            entry_price = close
-        elif close < bb_low:
-            position = "long"
-            entry_price = close
-    else:
-        if position == "long" and close > bb_high:
-            trade_profit = (close - entry_price) * lot_size
-            fee = (entry_price + close) * lot_size * taker_fee_rate
-            profit += trade_profit - fee
-            position = None
-        elif position == "short" and close < bb_low:
-            trade_profit = (entry_price - close) * lot_size
-            fee = (entry_price + close) * lot_size * taker_fee_rate
-            profit += trade_profit - fee
-            position = None
+    position = None
+    entry_price = 0
+    profit = 0
+    profits = []
+    timestamps = []
 
-    profits.append(profit)
-    timestamps.append(df["timestamp"].iloc[i])
+    for i in range(period, len(df)):
+        close = df["close"].iloc[i]
+        trend = df["supertrend"].iloc[i]
 
-# ====== 結果表示 ======
-print(f"総損益（手数料込み）: {profit:.4f} USDT")
-print(f"最終資産（手数料込み）: {initial_capital + profit:.4f} USDT")
+        if position is None:
+            if trend:
+                position = "long"
+                entry_price = close
+            else:
+                position = "short"
+                entry_price = close
+        else:
+            if position == "long" and not trend:
+                trade_profit = (close - entry_price) * lot_size
+                fee = (entry_price + close) * lot_size * taker_fee_rate
+                profit += trade_profit - fee
+                position = "short"
+                entry_price = close
+            elif position == "short" and trend:
+                trade_profit = (entry_price - close) * lot_size
+                fee = (entry_price + close) * lot_size * taker_fee_rate
+                profit += trade_profit - fee
+                position = "long"
+                entry_price = close
 
-# ====== 利益推移チャート ======
-plt.figure(figsize=(14,6))
-plt.plot(timestamps, profits, label="Cumulative Profit (after fees)", color="blue")
+        profits.append(profit)
+        timestamps.append(df["timestamp"].iloc[i])
+
+    return timestamps, profits, profit
+
+# ====== 複数パラメータでテスト ======
+plt.figure(figsize=(14, 6))
+colors = ["blue", "red", "green", "orange"]
+
+for idx, (period, mult) in enumerate(param_sets):
+    timestamps, profits, final_profit = backtest_supertrend(df_base, period, mult)
+    print(f"ATR期間={period}, 倍率={mult} → 総損益: {final_profit:.4f} USDT, 最終資産: {initial_capital + final_profit:.4f} USDT")
+    plt.plot(timestamps, profits, label=f"ATR={period}, Mult={mult}", color=colors[idx % len(colors)])
+
 plt.axhline(0, color="gray", linestyle="--", linewidth=1)
-plt.title(f"{symbol} Bollinger Band Strategy Profit ({timeframe}) - Initial {initial_capital} USDT (fees included)")
+plt.title(f"{symbol} SuperTrend Strategy Comparison ({timeframe})")
 plt.xlabel("Time")
 plt.ylabel("Profit (USDT)")
 plt.grid(True)
