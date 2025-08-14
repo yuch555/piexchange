@@ -1,197 +1,177 @@
-import ccxt
-import pandas as pd
-import ta
-import time
-from datetime import datetime
-import matplotlib.pyplot as plt
 import os
-import numpy as np
-from tqdm import tqdm  # プログレスバー
+import time
+import math
+import traceback
+import ccxt
+from dotenv import load_dotenv
+load_dotenv()
 
-# ====== 設定 ======
-symbol = "PI/USDT"
-timeframe = "5m"
-lookback_days = 100
-csv_file = "piusdt_5m_100d.csv"
-initial_capital = 1000
-taker_fee_rate = 0.001
+# ========= 設定 =========
+symbol = "PI/USDT"              # ★スポット用シンボル（要確認）
+poll_interval_sec = 2           # 価格監視のポーリング間隔（秒）
+testFlag = True                 # True: 最小数量で成行BUY→30秒後に成行SELL（1回だけ）
 
-exchange = ccxt.bitget()
+# APIキーは環境変数から
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
+BITGET_SECRET = os.getenv("BITGET_SECRET", "")
+BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
 
-# ====== テストするパラメータ ======
-param_sets = [
-    (11, 5.7),
-]
+# ========= 取引所設定（スポット） =========
+exchange = ccxt.bitget({
+    "apiKey": BITGET_API_KEY,
+    "secret": BITGET_SECRET,
+    "password": BITGET_PASSPHRASE,     # Bitgetはpassphraseが必要
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "spot",
+        # 一部取引所で「成行買いにpriceが必要」な場合があるための保険
+        "createMarketBuyOrderRequiresPrice": False,
+    },
+})
 
+def load_market(symbol: str):
+    markets = exchange.load_markets()
+    if symbol not in markets:
+        raise ValueError(f"{symbol} は取引所に見つかりませんでした。シンボル名/上場状況を確認してください。")
+    market = markets[symbol]
+    if market.get("type") != "spot":
+        # ccxtの記述がない場合もあるので、spotとして扱えるかチェック
+        pass
+    return market
 
-# ====== データ取得 ======
-def fetch_ohlcv_all(symbol, timeframe, days):
-    all_data = []
-    now = exchange.milliseconds()
-    since = now - days * 24 * 60 * 60 * 1000
-    limit = 500
-    while True:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-        if not ohlcv:
-            break
-        all_data += ohlcv
-        since = ohlcv[-1][0] + 1
-        time.sleep(exchange.rateLimit / 1000)
-        if pd.to_datetime(ohlcv[-1][0], unit="ms") >= datetime.utcnow():
-            break
-    return all_data
+def round_to_precision(amount: float, precision: int):
+    if precision is None:
+        return amount
+    # 例: precision=4 -> 0.0001刻み
+    factor = 10 ** precision
+    return math.floor(amount * factor) / factor
 
-if os.path.exists(csv_file):
-    print(f"{csv_file} が存在するため、CSVから読み込みます...")
-    df_base = pd.read_csv(csv_file, parse_dates=["timestamp"])
-else:
-    print(f"{csv_file} が存在しないため、APIから取得します...")
-    ohlcv_data = fetch_ohlcv_all(symbol, timeframe, lookback_days)
-    df_base = pd.DataFrame(ohlcv_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df_base["timestamp"] = pd.to_datetime(df_base["timestamp"], unit="ms")
-    df_base.to_csv(csv_file, index=False)
+def calc_min_buy_amount(market: dict, last_price: float):
+    """取引最小数量/最小名目に基づく、購入最小数量（ベース通貨量）を算出"""
+    limits = market.get("limits", {}) or {}
+    amt_min = (limits.get("amount") or {}).get("min") or 0.0
+    cost_min = (limits.get("cost") or {}).get("min") or 0.0
 
-# ====== SuperTrend関数 ======
-def calculate_supertrend(df, period=14, multiplier=3.5):
-    hl2 = (df["high"] + df["low"]) / 2
-    atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=period).average_true_range()
-    upperband = hl2 + (multiplier * atr)
-    lowerband = hl2 - (multiplier * atr)
+    # 名目制限がある場合は cost_min / 価格 でベース量の下限を計算
+    base_min_from_cost = (cost_min / last_price) if (cost_min and last_price > 0) else 0.0
+    base_min = max(amt_min or 0.0, base_min_from_cost or 0.0)
 
-    supertrend = [True] * len(df)
-    for i in range(1, len(df)):
-        if df["close"].iloc[i] > upperband.iloc[i-1]:
-            supertrend[i] = True
-        elif df["close"].iloc[i] < lowerband.iloc[i-1]:
-            supertrend[i] = False
-        else:
-            supertrend[i] = supertrend[i-1]
-            if supertrend[i] and lowerband.iloc[i] < lowerband.iloc[i-1]:
-                lowerband.iloc[i] = lowerband.iloc[i-1]
-            if not supertrend[i] and upperband.iloc[i] > upperband.iloc[i-1]:
-                upperband.iloc[i] = upperband.iloc[i-1]
-    return pd.DataFrame({
-        "supertrend": supertrend,
-        "upperband": upperband,
-        "lowerband": lowerband
-    })
+    # precisionに丸め
+    prec = market.get("precision", {}).get("amount")
+    if base_min <= 0:
+        # 取引所から最小が取れない場合のフェイルセーフ（極小額）
+        base_min = 1.0 / (10 ** (prec or 4))
+    base_min = round_to_precision(base_min, prec)
+    # 丸めでゼロにならないよう保険
+    if base_min <= 0:
+        base_min = 1.0 / (10 ** ((prec or 4) + 1))
+    return base_min
 
-# ====== バックテスト関数 ======
-def backtest_supertrend(df, period, multiplier):
-    st = calculate_supertrend(df, period=period, multiplier=multiplier)
-    df = pd.concat([df.reset_index(drop=True), st], axis=1)
+def fetch_last_price(symbol: str) -> float:
+    # fetch_tickerのlast/closeを優先
+    t = exchange.fetch_ticker(symbol)
+    last = t.get("last") or t.get("close")
+    if not last:
+        # 最終手段：板のミッド
+        ob = exchange.fetch_order_book(symbol)
+        bid = ob["bids"][0][0] if ob["bids"] else None
+        ask = ob["asks"][0][0] if ob["asks"] else None
+        if bid and ask:
+            last = (bid + ask) / 2
+    if not last:
+        raise RuntimeError("価格を取得できませんでした。シンボル/ネットワークを確認してください。")
+    return float(last)
 
-    current_price = df["close"].iloc[0]
-    lot_size = initial_capital / current_price
+def market_buy(symbol: str, amount_base: float):
+    # 多くの取引所は base量指定での成行BUYを受け付ける
+    # もしエラーが出る場合は price を併記 or 'cost'指定が必要なことがあります
+    params = {}  # 取引所固有パラメータが必要ならここに追加
+    order = exchange.create_order(symbol, type="market", side="buy", amount=amount_base, price=None, params=params)
+    return order
 
-    position = None
-    entry_price = 0
-    profit = 0
-    profits = []
-    timestamps = []
+def market_sell(symbol: str, amount_base: float):
+    params = {}
+    order = exchange.create_order(symbol, type="market", side="sell", amount=amount_base, price=None, params=params)
+    return order
 
-    trade_count = 0
-    win_count = 0
+def get_free_balance(code: str) -> float:
+    balance = exchange.fetch_balance()
+    # ccxtのbalancesは {"free": {"USDT": x, "PI": y}, "total": ...} のような構造
+    free = balance.get("free", {}).get(code)
+    if free is None:
+        # 一部取引所は {'PI': {'free': x, ...}} 形式
+        coin = balance.get(code) or {}
+        free = coin.get("free", 0.0)
+    return float(free or 0.0)
 
-    for i in range(period, len(df)):
-        close = df["close"].iloc[i]
-        trend = df["supertrend"].iloc[i]
+def symbol_codes(market: dict):
+    base = market.get("base") or symbol.split("/")[0]
+    quote = market.get("quote") or symbol.split("/")[1]
+    return base, quote
 
-        if position is None:
-            if trend:
-                position = "long"
-                entry_price = close
-            else:
-                position = "short"
-                entry_price = close
-        else:
-            if position == "long" and not trend:
-                trade_profit = (close - entry_price) * lot_size
-                fee = (entry_price + close) * lot_size * taker_fee_rate
-                net_profit = trade_profit - fee
-                profit += net_profit
-                trade_count += 1
-                if net_profit > 0:
-                    win_count += 1
-                position = "short"
-                entry_price = close
-            elif position == "short" and trend:
-                trade_profit = (entry_price - close) * lot_size
-                fee = (entry_price + close) * lot_size * taker_fee_rate
-                net_profit = trade_profit - fee
-                profit += net_profit
-                trade_count += 1
-                if net_profit > 0:
-                    win_count += 1
-                position = "long"
-                entry_price = close
+def test_trade_once(symbol: str):
+    """最小数量で成行BUY → 30秒待機 → 成行SELL（1回だけ）"""
+    print("=== 疎通テスト開始（最小数量で成行→30秒→成行クローズ）===")
+    market = load_market(symbol)
+    base, quote = symbol_codes(market)
 
-        profits.append(profit)
-        timestamps.append(df["timestamp"].iloc[i])
+    last = fetch_last_price(symbol)
+    min_amount = calc_min_buy_amount(market, last)
+    print(f"[INFO] 最終価格: {last}, 最小購入量: {min_amount} {base}")
 
-    # 最大ドローダウン計算
-    equity_curve = np.array([initial_capital + p for p in profits])
-    peak = np.maximum.accumulate(equity_curve)
-    drawdown = (equity_curve - peak) / peak
-    max_drawdown = drawdown.min() * 100  # %
+    # 成行BUY
+    print("[ORDER] Market BUY 送信中...")
+    buy = market_buy(symbol, min_amount)
+    print(f"[OK] BUY注文ID: {buy.get('id')}, 成約数: {buy.get('filled')} {base}")
 
-    win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0
+    print("[SLEEP] 30秒待機してから成行SELLします...")
+    time.sleep(30)
 
-    stats = {
-        "final_profit": profit,
-        "final_equity": initial_capital + profit,
-        "trade_count": trade_count,
-        "win_rate": win_rate,
-        "max_drawdown": max_drawdown
-    }
+    # 実際に保有している数量（手数料控除等で min_amount より微妙に少ない可能性あり）
+    base_free = get_free_balance(base)
+    # precisionに丸めつつ、ゼロにならないよう少し控えめに売る
+    amount_to_sell = min(base_free, min_amount)
+    prec = market.get("precision", {}).get("amount")
+    amount_to_sell = round_to_precision(amount_to_sell, prec)
+    if amount_to_sell <= 0:
+        raise RuntimeError("売却数量が0になってしまいました。残高/精度を確認してください。")
 
-    return timestamps, profits, stats
+    print(f"[ORDER] Market SELL 送信中... （売却数量: {amount_to_sell} {base})")
+    sell = market_sell(symbol, amount_to_sell)
+    print(f"[OK] SELL注文ID: {sell.get('id')}, 成約数: {sell.get('filled')} {base}")
 
-# ====== 複数パラメータでテスト（プログレスバー付き） ======
-results = []
+    # 残高サマリ
+    base_free_after = get_free_balance(base)
+    quote_free_after = get_free_balance(quote)
+    print(f"[BALANCE] {base}: {base_free_after}, {quote}: {quote_free_after}")
+    print("=== 疎通テスト完了 ===")
 
-for period, mult in tqdm(param_sets, desc="バックテスト中", unit="パターン"):
-    timestamps, profits, stats = backtest_supertrend(df_base, period, mult)
-    results.append({
-        "period": period,
-        "mult": mult,
-        "timestamps": timestamps,
-        "profits": profits,
-        **stats
-    })
+def main():
+    try:
+        # APIキー存在チェック
+        if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE):
+            raise RuntimeError("APIキー/シークレット/パスフレーズが未設定です。環境変数 BITGET_API_KEY/SECRET/PASSPHRASE を設定してください。")
 
-# 総損益でソート
-results_sorted = sorted(results, key=lambda x: x["final_profit"], reverse=True)
+        # 事前にマーケットメタをロード（limits/precision取得のため）
+        load_market(symbol)
 
-# ===== 上位5位 =====
-print("\n=== 上位5位 ===")
-for r in results_sorted[:5]:
-    print(f"ATR期間={r['period']}, 倍率={r['mult']} → "
-          f"総損益: {r['final_profit']:.4f} USDT, "
-          f"最終資産: {r['final_equity']:.4f} USDT, "
-          f"トレード数: {r['trade_count']}, "
-          f"勝率: {r['win_rate']:.2f}%, "
-          f"最大DD: {r['max_drawdown']:.2f}%")
+        if testFlag:
+            test_trade_once(symbol)
+            return
 
-# ===== 下位5位 =====
-print("\n=== 下位5位 ===")
-for r in results_sorted[-5:]:
-    print(f"ATR期間={r['period']}, 倍率={r['mult']} → "
-          f"総損益: {r['final_profit']:.4f} USDT, "
-          f"最終資産: {r['final_equity']:.4f} USDT, "
-          f"トレード数: {r['trade_count']}, "
-          f"勝率: {r['win_rate']:.2f}%, "
-          f"最大DD: {r['max_drawdown']:.2f}%")
+        # ===== ここから本番ロジック（必要に応じて書き換えてください） =====
+        print("リアルタイム監視開始（本番ロジックは未実装：条件が整ったら発注するように追記してください）")
+        while True:
+            last = fetch_last_price(symbol)
+            print(f"[TICK] {symbol} last={last}")
+            # 例）ここにSuperTrend等の条件判定を入れて、発注関数 market_buy / market_sell を呼ぶ
+            # if 条件で買い: market_buy(symbol, amount)
+            # if 条件で売り: market_sell(symbol, amount)
+            time.sleep(poll_interval_sec)
 
-# ===== 上位5位をチャート表示 =====
-plt.figure(figsize=(14, 6))
-for r in results_sorted[:5]:
-    plt.plot(r["timestamps"], r["profits"], label=f"ATR={r['period']}, Mult={r['mult']}")
-plt.axhline(0, color="gray", linestyle="--", linewidth=1)
-plt.title(f"{symbol} SuperTrend Strategy - Top 5 Results ({timeframe})")
-plt.xlabel("Time")
-plt.ylabel("Profit (USDT)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
+    except Exception as e:
+        print("[ERROR]", e)
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
