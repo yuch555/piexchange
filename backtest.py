@@ -14,7 +14,7 @@ timeframe = "5m"
 lookback_days = 30
 csv_file = "piusdt_5m_100d.csv"
 initial_capital = 1000
-taker_fee_rate = 0.001
+taker_fee_rate = 0.00042
 
 exchange = ccxt.bitget()
 
