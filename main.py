@@ -5,22 +5,24 @@ import time
 from datetime import datetime
 import matplotlib.pyplot as plt
 import os
+import numpy as np
+from tqdm import tqdm  # プログレスバー
 
 # ====== 設定 ======
 symbol = "PI/USDT"
 timeframe = "5m"
-lookback_days = 7
-csv_file = "piusdt_5m_7d.csv"
-initial_capital = 1500
+lookback_days = 30
+csv_file = "piusdt_5m_30d.csv"
+initial_capital = 1000
 taker_fee_rate = 0.001
 
 exchange = ccxt.bitget()
 
 # ====== テストするパラメータ ======
 param_sets = [
-    (7, 6),
-    (6, 6),
-    (8, 6)
+    (atr_period, multiplier)
+    for atr_period in range(4, 15)  # 4〜14
+    for multiplier in [x / 2 for x in range(4, 13)]  # 2.0〜6.0（0.5刻み）
 ]
 
 # ====== データ取得 ======
@@ -89,6 +91,9 @@ def backtest_supertrend(df, period, multiplier):
     profits = []
     timestamps = []
 
+    trade_count = 0
+    win_count = 0
+
     for i in range(period, len(df)):
         close = df["close"].iloc[i]
         trend = df["supertrend"].iloc[i]
@@ -104,32 +109,87 @@ def backtest_supertrend(df, period, multiplier):
             if position == "long" and not trend:
                 trade_profit = (close - entry_price) * lot_size
                 fee = (entry_price + close) * lot_size * taker_fee_rate
-                profit += trade_profit - fee
+                net_profit = trade_profit - fee
+                profit += net_profit
+                trade_count += 1
+                if net_profit > 0:
+                    win_count += 1
                 position = "short"
                 entry_price = close
             elif position == "short" and trend:
                 trade_profit = (entry_price - close) * lot_size
                 fee = (entry_price + close) * lot_size * taker_fee_rate
-                profit += trade_profit - fee
+                net_profit = trade_profit - fee
+                profit += net_profit
+                trade_count += 1
+                if net_profit > 0:
+                    win_count += 1
                 position = "long"
                 entry_price = close
 
         profits.append(profit)
         timestamps.append(df["timestamp"].iloc[i])
 
-    return timestamps, profits, profit
+    # 最大ドローダウン計算
+    equity_curve = np.array([initial_capital + p for p in profits])
+    peak = np.maximum.accumulate(equity_curve)
+    drawdown = (equity_curve - peak) / peak
+    max_drawdown = drawdown.min() * 100  # %
 
-# ====== 複数パラメータでテスト ======
+    win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0
+
+    stats = {
+        "final_profit": profit,
+        "final_equity": initial_capital + profit,
+        "trade_count": trade_count,
+        "win_rate": win_rate,
+        "max_drawdown": max_drawdown
+    }
+
+    return timestamps, profits, stats
+
+# ====== 複数パラメータでテスト（プログレスバー付き） ======
+results = []
+
+for period, mult in tqdm(param_sets, desc="バックテスト中", unit="パターン"):
+    timestamps, profits, stats = backtest_supertrend(df_base, period, mult)
+    results.append({
+        "period": period,
+        "mult": mult,
+        "timestamps": timestamps,
+        "profits": profits,
+        **stats
+    })
+
+# 総損益でソート
+results_sorted = sorted(results, key=lambda x: x["final_profit"], reverse=True)
+
+# ===== 上位5位 =====
+print("\n=== 上位5位 ===")
+for r in results_sorted[:5]:
+    print(f"ATR期間={r['period']}, 倍率={r['mult']} → "
+          f"総損益: {r['final_profit']:.4f} USDT, "
+          f"最終資産: {r['final_equity']:.4f} USDT, "
+          f"トレード数: {r['trade_count']}, "
+          f"勝率: {r['win_rate']:.2f}%, "
+          f"最大DD: {r['max_drawdown']:.2f}%")
+
+# ===== 下位5位 =====
+print("\n=== 下位5位 ===")
+for r in results_sorted[-5:]:
+    print(f"ATR期間={r['period']}, 倍率={r['mult']} → "
+          f"総損益: {r['final_profit']:.4f} USDT, "
+          f"最終資産: {r['final_equity']:.4f} USDT, "
+          f"トレード数: {r['trade_count']}, "
+          f"勝率: {r['win_rate']:.2f}%, "
+          f"最大DD: {r['max_drawdown']:.2f}%")
+
+# ===== 上位5位をチャート表示 =====
 plt.figure(figsize=(14, 6))
-colors = ["blue", "red", "green", "orange"]
-
-for idx, (period, mult) in enumerate(param_sets):
-    timestamps, profits, final_profit = backtest_supertrend(df_base, period, mult)
-    print(f"ATR期間={period}, 倍率={mult} → 総損益: {final_profit:.4f} USDT, 最終資産: {initial_capital + final_profit:.4f} USDT")
-    plt.plot(timestamps, profits, label=f"ATR={period}, Mult={mult}", color=colors[idx % len(colors)])
-
+for r in results_sorted[:5]:
+    plt.plot(r["timestamps"], r["profits"], label=f"ATR={r['period']}, Mult={r['mult']}")
 plt.axhline(0, color="gray", linestyle="--", linewidth=1)
-plt.title(f"{symbol} SuperTrend Strategy Comparison ({timeframe})")
+plt.title(f"{symbol} SuperTrend Strategy - Top 5 Results ({timeframe})")
 plt.xlabel("Time")
 plt.ylabel("Profit (USDT)")
 plt.grid(True)
