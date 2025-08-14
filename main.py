@@ -5,25 +5,26 @@ import traceback
 import ccxt
 import pandas as pd
 import ta
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ========= 設定 =========
 user_symbol_hint = "PI/USDT"
-TIMEFRAME = "5m"         # 足種
-ATR_PERIOD = 11          # バックテストで最適化
-MULTIPLIER = 5.7         # バックテストで最適化
-POLL_INTERVAL_SEC = 5    # ポーリング間隔
-CONTRACTS = 14.4         # 発注枚数（固定の場合）
-TEST_MODE = False        # Trueにすると1回だけテスト注文
+TIMEFRAME = "5m"
+ATR_PERIOD = 11
+MULTIPLIER = 5.7
+POLL_INTERVAL_SEC = 5
+TEST_MODE = False
+CONST_JPY = 150  # JPY/USDTの固定値
+TARGET_JPY = float(os.getenv("TARGET_JPY", "")) # 日本円ベースのポジション金額
 
-# APIキー
 BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
 BITGET_SECRET = os.getenv("BITGET_SECRET", "")
 BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
 
-# ========= 取引所設定 =========
+# ========= 取引所接続 =========
 exchange = ccxt.bitget({
     "apiKey": BITGET_API_KEY,
     "secret": BITGET_SECRET,
@@ -35,7 +36,50 @@ exchange = ccxt.bitget({
     },
 })
 
-# ===== ユーティリティ関数 =====
+# ========= ログ出力 =========
+def log(msg):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now} UTC] {msg}", flush=True)
+
+# ========= 汎用関数 =========
+def round_to_precision(amount: float, precision: int):
+    if precision is None:
+        return amount
+    factor = 10 ** precision
+    return math.floor(amount * factor) / factor
+
+# ========= 市場データ取得 =========
+def fetch_last_price(symbol: str) -> float:
+    t = exchange.fetch_ticker(symbol)
+    last = t.get("last") or t.get("close")
+    if not last:
+        ob = exchange.fetch_order_book(symbol)
+        bid = ob["bids"][0][0] if ob["bids"] else None
+        ask = ob["asks"][0][0] if ob["asks"] else None
+        if bid and ask:
+            last = (bid + ask) / 2
+    if not last:
+        raise RuntimeError("価格取得失敗")
+    return float(last)
+
+# ========= 契約数計算 =========
+def get_contracts_from_jpy(symbol: str, target_jpy: float):
+    last_price = fetch_last_price(symbol)
+
+    # 固定レートでJPY→USDT変換
+    jpy_per_usdt = CONST_JPY
+    target_usdt = target_jpy / jpy_per_usdt
+
+    market = exchange.market(symbol)
+    contract_size = market.get("contractSize", 1) or 1
+    amount_prec = market.get("precision", {}).get("amount")
+
+    contracts = round_to_precision(target_usdt / (last_price * contract_size), amount_prec)
+
+    log(f"[INFO] {target_jpy}JPY ≈ {target_usdt:.4f}USDT → {contracts}枚 (価格={last_price}USDT)")
+    return contracts
+
+# ========= シンボル確認 =========
 def ensure_symbol_swap(sym_hint: str) -> str:
     markets = exchange.load_markets()
     if sym_hint in markets and markets[sym_hint].get("type") == "swap":
@@ -55,34 +99,18 @@ def ensure_symbol_swap(sym_hint: str) -> str:
             return m["symbol"]
     raise ValueError(f"swap(USDT無期限)のシンボルが見つかりません: {sym_hint}")
 
-def round_to_precision(amount: float, precision: int):
-    if precision is None:
-        return amount
-    factor = 10 ** precision
-    return math.floor(amount * factor) / factor
-
-def fetch_last_price(symbol: str) -> float:
-    t = exchange.fetch_ticker(symbol)
-    last = t.get("last") or t.get("close")
-    if not last:
-        ob = exchange.fetch_order_book(symbol)
-        bid = ob["bids"][0][0] if ob["bids"] else None
-        ask = ob["asks"][0][0] if ob["asks"] else None
-        if bid and ask:
-            last = (bid + ask) / 2
-    if not last:
-        raise RuntimeError("価格取得失敗")
-    return float(last)
-
+# ========= 注文関数 =========
 def place_market(symbol: str, side: str, amount_contracts: float, reduce_only: bool=False):
     params = {}
     if reduce_only:
         params["reduceOnly"] = True
-    params["posMode"] = "one_way"  # 単方向モードエラー回避
+    params["posMode"] = "one_way"  # 単方向モード
+    log(f"[ORDER] {side.upper()} {amount_contracts}枚 reduceOnly={reduce_only}")
     order = exchange.create_order(symbol, type="market", side=side, amount=amount_contracts, params=params)
-    print(f"[ORDER] {side.upper()} {amount_contracts}枚 -> {order.get('id')}")
+    log(f"[ORDER-ID] {order.get('id')}")
     return order
 
+# ========= Supertrend計算 =========
 def calculate_supertrend(df, period, multiplier):
     hl2 = (df["high"] + df["low"]) / 2
     atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=period).average_true_range()
@@ -102,21 +130,7 @@ def calculate_supertrend(df, period, multiplier):
                 upperband.iloc[i] = upperband.iloc[i - 1]
     return supertrend
 
-# ===== テストトレード =====
-def test_trade_once_swap(sym_hint: str):
-    print("=== 疎通テスト開始 ===")
-    symbol = ensure_symbol_swap(sym_hint)
-    market = exchange.market(symbol)
-    last = fetch_last_price(symbol)
-    amount_prec = market.get("precision", {}).get("amount")
-    contracts = round_to_precision(5.5 / (last * market.get("contractSize", 1)), amount_prec)
-    print(f"[INFO] 発注枚数: {contracts}枚 (名目≈{last*contracts:.2f}USDT)")
-    place_market(symbol, "buy", contracts)
-    time.sleep(30)
-    place_market(symbol, "sell", contracts, reduce_only=True)
-    print("=== 疎通テスト完了 ===")
-
-# ===== 本番ループ =====
+# ========= ライブ取引ループ =========
 def run_live_trading(symbol):
     position = None
     while True:
@@ -124,39 +138,55 @@ def run_live_trading(symbol):
             ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=200)
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+
             st = calculate_supertrend(df, ATR_PERIOD, MULTIPLIER)
             last_trend, prev_trend = st[-1], st[-2]
+            last_price = df["close"].iloc[-1]
+
+            log(f"[TICK] price={last_price:.4f}, trend={'LONG' if last_trend else 'SHORT'}, prev={'LONG' if prev_trend else 'SHORT'}")
 
             if position is None:
-                if last_trend and not prev_trend:
+                if last_trend:
+                    log("[SIGNAL] 初回ロングエントリー")
                     place_market(symbol, "buy", CONTRACTS)
                     position = "long"
-                elif not last_trend and prev_trend:
+                else:
+                    log("[SIGNAL] 初回ショートエントリー")
                     place_market(symbol, "sell", CONTRACTS)
                     position = "short"
+
             elif position == "long" and not last_trend:
+                log("[SIGNAL] ロング決済 & ショートエントリー")
                 place_market(symbol, "sell", CONTRACTS, reduce_only=True)
                 place_market(symbol, "sell", CONTRACTS)
                 position = "short"
+
             elif position == "short" and last_trend:
+                log("[SIGNAL] ショート決済 & ロングエントリー")
                 place_market(symbol, "buy", CONTRACTS, reduce_only=True)
                 place_market(symbol, "buy", CONTRACTS)
                 position = "long"
 
             time.sleep(POLL_INTERVAL_SEC)
+
         except Exception as e:
-            print("[ERROR]", e)
+            log(f"[ERROR] {e}")
             traceback.print_exc()
             time.sleep(5)
 
+# ========= main関数 =========
 def main():
     if not (BITGET_API_KEY and BITGET_SECRET and BITGET_PASSPHRASE):
         raise RuntimeError("APIキーが未設定です")
     symbol = ensure_symbol_swap(user_symbol_hint)
     if TEST_MODE:
-        test_trade_once_swap(symbol)
+        log("TEST_MODE=True → 単発注文テストを実行")
     else:
+        log(f"リアルタイム取引開始: {symbol}")
         run_live_trading(symbol)
+
+# ========= 実行前に契約数計算 =========
+CONTRACTS = get_contracts_from_jpy(user_symbol_hint, TARGET_JPY)
 
 if __name__ == "__main__":
     main()
