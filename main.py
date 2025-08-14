@@ -11,8 +11,8 @@ from tqdm import tqdm  # プログレスバー
 # ====== 設定 ======
 symbol = "PI/USDT"
 timeframe = "5m"
-lookback_days = 30
-csv_file = "piusdt_5m_30d.csv"
+lookback_days = 100
+csv_file = "piusdt_5m_100d.csv"
 initial_capital = 1000
 taker_fee_rate = 0.001
 
@@ -20,10 +20,9 @@ exchange = ccxt.bitget()
 
 # ====== テストするパラメータ ======
 param_sets = [
-    (atr_period, multiplier)
-    for atr_period in range(4, 15)  # 4〜14
-    for multiplier in [x / 2 for x in range(4, 13)]  # 2.0〜6.0（0.5刻み）
+    (11, 5.7),
 ]
+
 
 # ====== データ取得 ======
 def fetch_ohlcv_all(symbol, timeframe, days):
