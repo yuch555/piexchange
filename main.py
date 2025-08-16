@@ -13,8 +13,8 @@ load_dotenv()
 # ========= 設定 =========
 user_symbol_hint = "PI/USDT"
 TIMEFRAME = "5m"
-ATR_PERIOD = 11
-MULTIPLIER = 5.7
+ATR_PERIOD = 21
+MULTIPLIER = 6.3
 POLL_INTERVAL_SEC = 5
 TEST_MODE = False
 CONST_JPY = 150  # JPY/USDTの固定値

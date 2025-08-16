@@ -10,6 +10,7 @@ from tqdm import tqdm
 import glob
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
+import matplotlib.dates as mdates
 # ====== 実行対象を直接指定（先頭のプレフィックス = ファイル名の _ の前） ======
 # 例: TARGET_SYMBOL = "BTC" とすると data/BTC_USDT_5m_100d.csv を使う
 # None のままだと data/ 内の全CSVを処理します
@@ -184,6 +185,38 @@ def run_params_for_symbol(df, symbol, param_sets, workers=1):
                     tqdm.write(f"Error {symbol} {(period, mult)}: {e}")
     return results
 
+def _ensure_dir(path):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+def plot_equity(timestamps, profits, title=None, outpath=None, show=True):
+    if not timestamps or not profits:
+        return
+    x = pd.to_datetime(timestamps)
+    equity = np.array([initial_capital + p for p in profits])
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(x, equity, linewidth=1.25)
+    plt.fill_between(x, equity, initial_capital, where=(equity >= initial_capital), color="tab:green", alpha=0.12)
+    plt.fill_between(x, equity, initial_capital, where=(equity < initial_capital), color="tab:red", alpha=0.12)
+    plt.axhline(initial_capital, color="gray", linestyle="--", linewidth=0.8)
+    if title:
+        plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("Equity (USDT)")
+    plt.grid(True, alpha=0.3)
+    ax = plt.gca()
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
+    plt.tight_layout()
+    if outpath:
+        _ensure_dir(outpath)
+        plt.savefig(outpath, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
 # ====== メイン ======
 def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -200,6 +233,9 @@ def main():
             print(f"{TARGET_SYMBOL} に対応する CSV が見つかりません（プレフィックス: {pref}）")
             return
 
+    plots_dir = "plots"
+    os.makedirs(plots_dir, exist_ok=True)
+
     overall_best = []
     all_results = []
 
@@ -215,17 +251,44 @@ def main():
         all_results.extend(results)
         best = max(results, key=lambda x: x["final_profit"])
         overall_best.append(best)
-        # 銘柄上位3表示
+        # 銘柄上位3表示 + プロット表示/保存
         top3 = sorted(results, key=lambda x: x["final_profit"], reverse=True)[:3]
         print(f"\n=== {sym} 上位3パターン ===")
-        for r in top3:
+        for idx, r in enumerate(top3, start=1):
             print(f"ATR={r['period']}, Mult={r['mult']} → 損益:{r['final_profit']:.4f}, 最終資産:{r['final_equity']:.4f}, 取引数:{r['trade_count']}, 勝率:{r['win_rate']:.2f}%, 最大DD:{r['max_drawdown']:.2f}%")
+            title = f"{sym} SuperTrend ATR={r['period']} Mult={r['mult']}"
+            outpath = os.path.join(plots_dir, f"{sym.replace('/','_')}_top{idx}_ATR{r['period']}_M{r['mult']}.png")
+            # 同時に保存して画面にも表示
+            plot_equity(r.get("timestamps", []), r.get("profits", []), title=title, outpath=outpath, show=True)
 
     # 全銘柄ランキング
     overall_sorted = sorted(overall_best, key=lambda x: x["final_profit"], reverse=True)
     print("\n=== 全銘柄ベストランキング（上位20） ===")
     for r in overall_sorted[:20]:
         print(f"{r['symbol']} | ATR={r['period']} Mult={r['mult']} → 総損益:{r['final_profit']:.4f}, 最終資産:{r['final_equity']:.4f}")
+
+    # 全銘柄トップ比較プロット（上位5を比較、表示＋保存）
+    top_overall = overall_sorted[:5]
+    if top_overall:
+        plt.figure(figsize=(12, 6))
+        for r in top_overall:
+            ts = pd.to_datetime(r.get("timestamps", []))
+            if len(ts) == 0:
+                continue
+            equity = np.array([initial_capital + p for p in r.get("profits", [])])
+            plt.plot(ts, equity, label=f"{r['symbol']} ATR={r['period']} M={r['mult']}")
+        plt.axhline(initial_capital, color="gray", linestyle="--", linewidth=0.8)
+        plt.title("Top overall equity comparison")
+        plt.xlabel("Time")
+        plt.ylabel("Equity (USDT)")
+        plt.legend(loc="best", fontsize="small")
+        plt.grid(True, alpha=0.3)
+        outall = os.path.join(plots_dir, "overall_top5.png")
+        _ensure_dir(outall)
+        plt.tight_layout()
+        plt.savefig(outall, dpi=150)
+        plt.show()
+        plt.close()
 
     # 結果を CSV に保存
     outf = "results_all.csv"
