@@ -13,7 +13,7 @@ import csv
 # ====== 実行対象を直接指定（先頭のプレフィックス = ファイル名の _ の前） ======
 # 例: TARGET_SYMBOL = "BTC" とすると data/BTC_USDT_5m_100d.csv を使う
 # None のままだと data/ 内の全CSVを処理します
-TARGET_SYMBOL = "BTC"  # ここを "BTC" や "ETH" 等に変える
+TARGET_SYMBOL = "PI"  # ここを "BTC" や "ETH" 等に変える
 
 # ====== 設定 ======
 TIMEFRAME = "5m"
