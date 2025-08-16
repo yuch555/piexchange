@@ -45,7 +45,7 @@ API Key
 Secret Key
 
 Passphrase
-
+```
 プロジェクト直下に .env ファイルを作成し、以下を記入してください:
 
 ```BITGET_API_KEY="your_api_key"
