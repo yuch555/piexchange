@@ -6,52 +6,46 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import os
 import numpy as np
-from tqdm import tqdm  # プログレスバー
+from tqdm import tqdm
+import glob
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import csv
+# ====== 実行対象を直接指定（先頭のプレフィックス = ファイル名の _ の前） ======
+# 例: TARGET_SYMBOL = "BTC" とすると data/BTC_USDT_5m_100d.csv を使う
+# None のままだと data/ 内の全CSVを処理します
+TARGET_SYMBOL = "BTC"  # ここを "BTC" や "ETH" 等に変える
 
 # ====== 設定 ======
-symbol = "PI/USDT"
-timeframe = "5m"  
-lookback_days = 30
-csv_file = "piusdt_5m_100d.csv"
+TIMEFRAME = "5m"
+LOOKBACK_DAYS = 100
+CSV_DIR = "data"
+CSV_PATTERN = f"{CSV_DIR}/*_{TIMEFRAME}_{LOOKBACK_DAYS}d.csv"
+
 initial_capital = 1000
 taker_fee_rate = 0.00042
 
-exchange = ccxt.bitget()
+# 並列ワーカー数（環境に合わせて調整）
+PARAM_WORKERS = 20
+SYMBOL_WORKERS = 1
 
-# ====== テストするパラメータ ======
-param_sets = [
-    (11, 5.7),
-]
+# ====== テストするパラメータ（ここを編集して範囲拡張） ======
+param_sets = [(p, m) for p in range(7, 28) for m in [
+    4.5, 4.8, 5.1, 5.4, 5.7, 6.0, 6.3, 6.6, 6.9, 7.2,
+    7.5, 7.8, 8.1, 8.4, 8.7, 9.0, 9.3, 9.6, 9.9, 10.2, 10.5
+]]
 
+# ====== ユーティリティ ======
+def list_csv_files():
+    files = sorted(glob.glob(CSV_PATTERN))
+    return files
 
-# ====== データ取得 ======
-def fetch_ohlcv_all(symbol, timeframe, days):
-    all_data = []
-    now = exchange.milliseconds()
-    since = now - days * 24 * 60 * 60 * 1000
-    limit = 500
-    while True:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-        if not ohlcv:
-            break
-        all_data += ohlcv
-        since = ohlcv[-1][0] + 1
-        time.sleep(exchange.rateLimit / 1000)
-        if pd.to_datetime(ohlcv[-1][0], unit="ms") >= datetime.utcnow():
-            break
-    return all_data
+def load_df_from_csv(path):
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+    if df["timestamp"].dtype == object:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
 
-if os.path.exists(csv_file):
-    print(f"{csv_file} が存在するため、CSVから読み込みます...")
-    df_base = pd.read_csv(csv_file, parse_dates=["timestamp"])
-else:
-    print(f"{csv_file} が存在しないため、APIから取得します...")
-    ohlcv_data = fetch_ohlcv_all(symbol, timeframe, lookback_days)
-    df_base = pd.DataFrame(ohlcv_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df_base["timestamp"] = pd.to_datetime(df_base["timestamp"], unit="ms")
-    df_base.to_csv(csv_file, index=False)
-
-# ====== SuperTrend関数 ======
+# ====== SuperTrend ======
 def calculate_supertrend(df, period=14, multiplier=3.5):
     hl2 = (df["high"] + df["low"]) / 2
     atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=period).average_true_range()
@@ -59,51 +53,57 @@ def calculate_supertrend(df, period=14, multiplier=3.5):
     lowerband = hl2 - (multiplier * atr)
 
     supertrend = [True] * len(df)
+    # copy bands to be mutable
+    upper = upperband.copy()
+    lower = lowerband.copy()
+
     for i in range(1, len(df)):
-        if df["close"].iloc[i] > upperband.iloc[i-1]:
+        if df["close"].iloc[i] > upper.iloc[i-1]:
             supertrend[i] = True
-        elif df["close"].iloc[i] < lowerband.iloc[i-1]:
+        elif df["close"].iloc[i] < lower.iloc[i-1]:
             supertrend[i] = False
         else:
             supertrend[i] = supertrend[i-1]
-            if supertrend[i] and lowerband.iloc[i] < lowerband.iloc[i-1]:
-                lowerband.iloc[i] = lowerband.iloc[i-1]
-            if not supertrend[i] and upperband.iloc[i] > upperband.iloc[i-1]:
-                upperband.iloc[i] = upperband.iloc[i-1]
+            if supertrend[i] and lower.iloc[i] < lower.iloc[i-1]:
+                lower.iloc[i] = lower.iloc[i-1]
+            if not supertrend[i] and upper.iloc[i] > upper.iloc[i-1]:
+                upper.iloc[i] = upper.iloc[i-1]
+
     return pd.DataFrame({
         "supertrend": supertrend,
-        "upperband": upperband,
-        "lowerband": lowerband
+        "upperband": upper,
+        "lowerband": lower
     })
 
-# ====== バックテスト関数 ======
+# ====== バックテストロジック ======
+def backtest_supertrend_serial(args):
+    # wrapper for ProcessPoolExecutor mapping (receives tuple)
+    df, period, multiplier = args
+    return backtest_supertrend(df, period, multiplier)
+
 def backtest_supertrend(df, period, multiplier):
     st = calculate_supertrend(df, period=period, multiplier=multiplier)
-    df = pd.concat([df.reset_index(drop=True), st], axis=1)
+    df2 = pd.concat([df.reset_index(drop=True), st], axis=1)
 
-    current_price = df["close"].iloc[0]
+    current_price = df2["close"].iloc[0]
     lot_size = initial_capital / current_price
 
     position = None
-    entry_price = 0
-    profit = 0
+    entry_price = 0.0
+    profit = 0.0
     profits = []
     timestamps = []
 
     trade_count = 0
     win_count = 0
 
-    for i in range(period, len(df)):
-        close = df["close"].iloc[i]
-        trend = df["supertrend"].iloc[i]
+    for i in range(period, len(df2)):
+        close = df2["close"].iloc[i]
+        trend = df2["supertrend"].iloc[i]
 
         if position is None:
-            if trend:
-                position = "long"
-                entry_price = close
-            else:
-                position = "short"
-                entry_price = close
+            position = "long" if trend else "short"
+            entry_price = close
         else:
             if position == "long" and not trend:
                 trade_profit = (close - entry_price) * lot_size
@@ -127,15 +127,18 @@ def backtest_supertrend(df, period, multiplier):
                 entry_price = close
 
         profits.append(profit)
-        timestamps.append(df["timestamp"].iloc[i])
+        timestamps.append(df2["timestamp"].iloc[i])
 
-    # 最大ドローダウン計算
-    equity_curve = np.array([initial_capital + p for p in profits])
+    # ドローダウン
+    if len(profits) == 0:
+        equity_curve = np.array([initial_capital])
+    else:
+        equity_curve = np.array([initial_capital + p for p in profits])
     peak = np.maximum.accumulate(equity_curve)
     drawdown = (equity_curve - peak) / peak
-    max_drawdown = drawdown.min() * 100  # %
+    max_drawdown = drawdown.min() * 100 if len(drawdown) > 0 else 0.0
 
-    win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0
+    win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0.0
 
     stats = {
         "final_profit": profit,
@@ -147,109 +150,91 @@ def backtest_supertrend(df, period, multiplier):
 
     return timestamps, profits, stats
 
-def backtest_supertrend_spot(df, period, multiplier):
-    st = calculate_supertrend(df, period=period, multiplier=multiplier)
-    df = pd.concat([df.reset_index(drop=True), st], axis=1)
+def run_params_for_symbol(df, symbol, param_sets, workers=1):
+    results = []
+    if workers <= 1:
+        for period, mult in tqdm(param_sets, desc=f"{symbol} params", leave=False, unit="param"):
+            ts, pf, st = backtest_supertrend(df, period, mult)
+            results.append({
+                "symbol": symbol,
+                "period": period,
+                "mult": mult,
+                "timestamps": ts,
+                "profits": pf,
+                **st
+            })
+    else:
+        # use process pool to parallelize CPU work
+        args = [(df, p, m) for p, m in param_sets]
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(backtest_supertrend_serial, a): a[1:] for a in args}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"{symbol} params", leave=False, unit="param"):
+                period, mult = futures[fut]
+                try:
+                    ts, pf, st = fut.result()
+                    results.append({
+                        "symbol": symbol,
+                        "period": period,
+                        "mult": mult,
+                        "timestamps": ts,
+                        "profits": pf,
+                        **st
+                    })
+                except Exception as e:
+                    tqdm.write(f"Error {symbol} {(period, mult)}: {e}")
+    return results
 
-    usdt_balance = initial_capital
-    coin_balance = 0.0
-    profit_history = []
-    timestamps = []
+# ====== メイン ======
+def main():
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    csv_files = list_csv_files()
+    if not csv_files:
+        print(f"CSV が見つかりません: {CSV_PATTERN}")
+        return
 
-    trade_count = 0
-    win_count = 0
-    last_buy_price = None
+    # 単一指定がある場合はプレフィックスでフィルタ
+    if TARGET_SYMBOL:
+        pref = f"{TARGET_SYMBOL}_"
+        csv_files = [p for p in csv_files if os.path.basename(p).startswith(pref)]
+        if not csv_files:
+            print(f"{TARGET_SYMBOL} に対応する CSV が見つかりません（プレフィックス: {pref}）")
+            return
 
-    for i in range(period, len(df)):
-        close = df["close"].iloc[i]
-        trend = df["supertrend"].iloc[i]
+    overall_best = []
+    all_results = []
 
-        # ロングエントリー（現物買い）
-        if coin_balance == 0 and trend:
-            coin_balance = usdt_balance / close
-            usdt_balance = 0
-            last_buy_price = close
-            trade_count += 1
+    for path in tqdm(csv_files, desc="CSV読み込み/銘柄", unit="file"):
+        base = os.path.basename(path)
+        # ファイル名からシンボルを復元: ABC_USDT_5m_100d.csv -> ABC/USDT
+        sym = base.split("_")[0].replace("_", "/")
+        df = load_df_from_csv(path)
+        results = run_params_for_symbol(df, sym, param_sets, workers=PARAM_WORKERS)
+        if not results:
+            tqdm.write(f"{sym} は結果無し")
+            continue
+        all_results.extend(results)
+        best = max(results, key=lambda x: x["final_profit"])
+        overall_best.append(best)
+        # 銘柄上位3表示
+        top3 = sorted(results, key=lambda x: x["final_profit"], reverse=True)[:3]
+        print(f"\n=== {sym} 上位3パターン ===")
+        for r in top3:
+            print(f"ATR={r['period']}, Mult={r['mult']} → 損益:{r['final_profit']:.4f}, 最終資産:{r['final_equity']:.4f}, 取引数:{r['trade_count']}, 勝率:{r['win_rate']:.2f}%, 最大DD:{r['max_drawdown']:.2f}%")
 
-        # 売却（利確 or 損切り）
-        elif coin_balance > 0 and not trend:
-            sell_amount = coin_balance * close
-            fee = sell_amount * taker_fee_rate
-            usdt_balance = sell_amount - fee
-            coin_balance = 0
+    # 全銘柄ランキング
+    overall_sorted = sorted(overall_best, key=lambda x: x["final_profit"], reverse=True)
+    print("\n=== 全銘柄ベストランキング（上位20） ===")
+    for r in overall_sorted[:20]:
+        print(f"{r['symbol']} | ATR={r['period']} Mult={r['mult']} → 総損益:{r['final_profit']:.4f}, 最終資産:{r['final_equity']:.4f}")
 
-            # 勝ちトレード判定
-            if last_buy_price and close > last_buy_price:
-                win_count += 1
+    # 結果を CSV に保存
+    outf = "results_all.csv"
+    with open(outf, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["symbol", "period", "mult", "final_profit", "final_equity", "trade_count", "win_rate", "max_drawdown"])
+        writer.writeheader()
+        for r in all_results:
+            writer.writerow({k: r.get(k) for k in writer.fieldnames})
+    print(f"Saved {outf}")
 
-        # 評価額更新
-        total_value = usdt_balance + (coin_balance * close)
-        profit_history.append(total_value - initial_capital)
-        timestamps.append(df["timestamp"].iloc[i])
-
-    # 最大ドローダウン計算
-    equity_curve = np.array([initial_capital + p for p in profit_history])
-    peak = np.maximum.accumulate(equity_curve)
-    drawdown = (equity_curve - peak) / peak
-    max_drawdown = drawdown.min() * 100
-
-    win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0
-
-    stats = {
-        "final_profit": equity_curve[-1] - initial_capital,
-        "final_equity": equity_curve[-1],
-        "trade_count": trade_count,
-        "win_rate": win_rate,
-        "max_drawdown": max_drawdown
-    }
-
-    return timestamps, profit_history, stats
-
-# ====== 複数パラメータでテスト（プログレスバー付き） ======
-results = []
-
-for period, mult in tqdm(param_sets, desc="バックテスト中", unit="パターン"):
-    timestamps, profits, stats = backtest_supertrend(df_base, period, mult)
-    results.append({
-        "period": period,
-        "mult": mult,
-        "timestamps": timestamps,
-        "profits": profits,
-        **stats
-    })
-
-# 総損益でソート
-results_sorted = sorted(results, key=lambda x: x["final_profit"], reverse=True)
-
-# ===== 上位5位 =====
-print("\n=== 上位5位 ===")
-for r in results_sorted[:5]:
-    print(f"ATR期間={r['period']}, 倍率={r['mult']} → "
-          f"総損益: {r['final_profit']:.4f} USDT, "
-          f"最終資産: {r['final_equity']:.4f} USDT, "
-          f"トレード数: {r['trade_count']}, "
-          f"勝率: {r['win_rate']:.2f}%, "
-          f"最大DD: {r['max_drawdown']:.2f}%")
-
-# ===== 下位5位 =====
-print("\n=== 下位5位 ===")
-for r in results_sorted[-5:]:
-    print(f"ATR期間={r['period']}, 倍率={r['mult']} → "
-          f"総損益: {r['final_profit']:.4f} USDT, "
-          f"最終資産: {r['final_equity']:.4f} USDT, "
-          f"トレード数: {r['trade_count']}, "
-          f"勝率: {r['win_rate']:.2f}%, "
-          f"最大DD: {r['max_drawdown']:.2f}%")
-
-# ===== 上位5位をチャート表示 =====
-plt.figure(figsize=(14, 6))
-for r in results_sorted[:5]:
-    plt.plot(r["timestamps"], r["profits"], label=f"ATR={r['period']}, Mult={r['mult']}")
-plt.axhline(0, color="gray", linestyle="--", linewidth=1)
-plt.title(f"{symbol} SuperTrend Strategy - Top 5 Results ({timeframe})")
-plt.xlabel("Time")
-plt.ylabel("Profit (USDT)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
+if __name__ == "__main__":
+    main()
